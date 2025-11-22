@@ -17,10 +17,12 @@ import (
 )
 
 var (
-	certPath       string
-	privateKeyPath string
-	dnsCSVPath     string
-	dnsToIP        map[string]string // Maps DNS names to their allowed IP addresses
+	certPath              string
+	privateKeyPath        string
+	dnsCSVPath            string
+	dnsToIP               map[string]string // Maps DNS names to their allowed IP addresses
+	intermediateCertPath  string            // Path to intermediate CA certificate
+	intermediateKeyPath   string            // Path to intermediate CA private key
 )
 
 // EncryptRequest represents the JSON request body for encryption
@@ -111,9 +113,19 @@ func main() {
 		log.Fatalf("Failed to load DNS CSV: %v", err)
 	}
 
-	log.Printf("Using certificate from: %s", certPath)
-	log.Printf("Using private key from: %s", privateKeyPath)
+	log.Printf("Using root CA certificate from: %s", certPath)
+	log.Printf("Using root CA private key from: %s", privateKeyPath)
 	log.Printf("Loaded %d DNS-to-IP mappings from: %s", len(dnsToIP), dnsCSVPath)
+
+	// Setup intermediate CA (generate if doesn't exist)
+	var err error
+	intermediateCertPath, intermediateKeyPath, err = setupIntermediateCA(certPath, privateKeyPath)
+	if err != nil {
+		log.Fatalf("Failed to setup intermediate CA: %v", err)
+	}
+
+	log.Printf("Using intermediate CA certificate: %s", intermediateCertPath)
+	log.Printf("Using intermediate CA private key: %s", intermediateKeyPath)
 
 	// Setup Gin router
 	router := gin.Default()
@@ -191,8 +203,8 @@ func generateHandler(c *gin.Context) {
 		return
 	}
 
-	// Generate the certificate using openssl
-	cert, key, err := generateCertificate(req.Config, certPath, privateKeyPath)
+	// Generate the certificate using intermediate CA
+	cert, key, err := generateCertificate(req.Config, intermediateCertPath, intermediateKeyPath)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
 			Error: fmt.Sprintf("Certificate generation failed: %v", err),
@@ -485,7 +497,7 @@ func validateConfig(configContent string) error {
 }
 
 // generateCertificate generates a certificate and private key based on the config,
-// encrypts them with the root certificate, and stores them in the certificates folder
+// signs it with the provided CA, encrypts both with the CA certificate, and stores them in the certificates folder
 func generateCertificate(configContent, caCertPath, caKeyPath string) (string, string, error) {
 	// Create certificates directory if it doesn't exist
 	certsDir := "certificates"
@@ -569,6 +581,112 @@ func generateCertificate(configContent, caCertPath, caKeyPath string) (string, s
 	}
 
 	return string(certData), string(keyData), nil
+}
+
+// setupIntermediateCA generates an intermediate CA certificate signed by the root CA
+// if it doesn't already exist. Returns paths to the intermediate cert and key.
+func setupIntermediateCA(rootCertPath, rootKeyPath string) (string, string, error) {
+	// Define intermediate CA file paths in the same directory as the executable
+	intermediateCert := "intermediate-ca-cert.pem"
+	intermediateKey := "intermediate-ca-key.pem"
+
+	// Check if intermediate CA already exists
+	if _, err := os.Stat(intermediateCert); err == nil {
+		if _, err := os.Stat(intermediateKey); err == nil {
+			log.Printf("Using existing intermediate CA: %s", intermediateCert)
+			return intermediateCert, intermediateKey, nil
+		}
+	}
+
+	log.Println("Intermediate CA not found. Generating new intermediate CA...")
+
+	// Create intermediate CA configuration
+	intermediateConf := `[req]
+distinguished_name = req_distinguished_name
+prompt = no
+
+[req_distinguished_name]
+C = US
+ST = State
+L = City
+O = Intermediate CA Organization
+OU = Intermediate CA Unit
+CN = Intermediate CA
+
+[v3_intermediate_ca]
+basicConstraints = critical,CA:TRUE,pathlen:0
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always
+`
+
+	// Write configuration to temporary file
+	tmpConf, err := os.CreateTemp("", "intermediate-ca-*.conf")
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create temp config file: %w", err)
+	}
+	defer os.Remove(tmpConf.Name())
+
+	if _, err := tmpConf.WriteString(intermediateConf); err != nil {
+		return "", "", fmt.Errorf("failed to write config: %w", err)
+	}
+	tmpConf.Close()
+
+	// Generate intermediate CA private key
+	log.Println("Generating intermediate CA private key (4096-bit RSA)...")
+	cmd := exec.Command("openssl", "genrsa", "-out", intermediateKey, "4096")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return "", "", fmt.Errorf("failed to generate intermediate key: %w, output: %s", err, string(output))
+	}
+
+	// Set proper permissions on private key
+	if err := os.Chmod(intermediateKey, 0600); err != nil {
+		return "", "", fmt.Errorf("failed to set key permissions: %w", err)
+	}
+
+	// Generate CSR for intermediate CA
+	log.Println("Generating intermediate CA certificate signing request...")
+	tmpCSR, err := os.CreateTemp("", "intermediate-ca-*.csr")
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create temp CSR file: %w", err)
+	}
+	defer os.Remove(tmpCSR.Name())
+	tmpCSR.Close()
+
+	cmd = exec.Command("openssl", "req", "-new", "-key", intermediateKey, "-out", tmpCSR.Name(), "-config", tmpConf.Name())
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return "", "", fmt.Errorf("failed to generate CSR: %w, output: %s", err, string(output))
+	}
+
+	// Sign intermediate CA certificate with root CA
+	log.Println("Signing intermediate CA certificate with root CA...")
+	cmd = exec.Command("openssl", "x509", "-req", "-in", tmpCSR.Name(),
+		"-CA", rootCertPath, "-CAkey", rootKeyPath,
+		"-CAcreateserial", "-out", intermediateCert,
+		"-days", "3650", "-sha256",
+		"-extensions", "v3_intermediate_ca",
+		"-extfile", tmpConf.Name())
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return "", "", fmt.Errorf("failed to sign intermediate certificate: %w, output: %s", err, string(output))
+	}
+
+	// Set proper permissions on certificate
+	if err := os.Chmod(intermediateCert, 0644); err != nil {
+		return "", "", fmt.Errorf("failed to set cert permissions: %w", err)
+	}
+
+	// Verify the intermediate certificate
+	log.Println("Verifying intermediate CA certificate...")
+	cmd = exec.Command("openssl", "verify", "-CAfile", rootCertPath, intermediateCert)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return "", "", fmt.Errorf("intermediate certificate verification failed: %w, output: %s", err, string(output))
+	}
+
+	log.Printf("Intermediate CA generated successfully:")
+	log.Printf("  Certificate: %s", intermediateCert)
+	log.Printf("  Private Key: %s", intermediateKey)
+
+	return intermediateCert, intermediateKey, nil
 }
 
 // verifyCertificate verifies that a certificate was signed by the root CA
