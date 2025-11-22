@@ -54,6 +54,17 @@ type GenerateResponse struct {
 	PrivateKey  string `json:"private_key"`
 }
 
+// VerifyRequest represents the JSON request body for certificate verification
+type VerifyRequest struct {
+	Certificate string `json:"certificate" binding:"required"`
+}
+
+// VerifyResponse represents the JSON response for certificate verification
+type VerifyResponse struct {
+	Valid   bool   `json:"valid"`
+	Message string `json:"message"`
+}
+
 // ErrorResponse represents an error response
 type ErrorResponse struct {
 	Error string `json:"error"`
@@ -115,6 +126,9 @@ func main() {
 
 	// Certificate generation endpoint
 	router.POST("/generate", generateHandler)
+
+	// Certificate verification endpoint
+	router.POST("/verify", verifyHandler)
 
 	// Start server
 	port := os.Getenv("PORT")
@@ -224,6 +238,33 @@ func decryptHandler(c *gin.Context) {
 
 	c.JSON(http.StatusOK, DecryptResponse{
 		Data: string(decryptedData),
+	})
+}
+
+// verifyHandler handles certificate verification requests
+func verifyHandler(c *gin.Context) {
+	var req VerifyRequest
+
+	// Bind and validate request
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Error: fmt.Sprintf("Invalid request: %v", err),
+		})
+		return
+	}
+
+	// Verify the certificate against the root CA
+	valid, message, err := verifyCertificate(req.Certificate, certPath)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Error: fmt.Sprintf("Verification error: %v", err),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, VerifyResponse{
+		Valid:   valid,
+		Message: message,
 	})
 }
 
@@ -453,4 +494,42 @@ func generateCertificate(configContent, caCertPath, caKeyPath string) (string, s
 	}
 
 	return string(certData), string(keyData), nil
+}
+
+// verifyCertificate verifies that a certificate was signed by the root CA
+func verifyCertificate(certContent, caCertPath string) (bool, string, error) {
+	// Create temporary file for the certificate to verify
+	tmpCert, err := os.CreateTemp("", "verify-cert-*.pem")
+	if err != nil {
+		return false, "", fmt.Errorf("failed to create temp certificate file: %w", err)
+	}
+	defer os.Remove(tmpCert.Name())
+	defer tmpCert.Close()
+
+	// Write certificate to temp file
+	if _, err := tmpCert.WriteString(certContent); err != nil {
+		return false, "", fmt.Errorf("failed to write certificate to temp file: %w", err)
+	}
+	tmpCert.Close()
+
+	// Execute openssl verify command
+	// openssl verify -CAfile root-ca-cert.pem cert-to-verify.pem
+	cmd := exec.Command("openssl", "verify", "-CAfile", caCertPath, tmpCert.Name())
+	output, err := cmd.CombinedOutput()
+
+	outputStr := strings.TrimSpace(string(output))
+
+	// Check if verification succeeded
+	// OpenSSL outputs "filename: OK" on success
+	if err == nil && strings.Contains(outputStr, ": OK") {
+		return true, "Certificate is valid and was signed by the root CA", nil
+	}
+
+	// Verification failed
+	if err != nil {
+		// Extract meaningful error message from OpenSSL output
+		return false, fmt.Sprintf("Certificate verification failed: %s", outputStr), nil
+	}
+
+	return false, "Certificate verification failed", nil
 }
