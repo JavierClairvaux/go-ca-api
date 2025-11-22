@@ -309,6 +309,47 @@ func decryptWithPrivateKey(encryptedData []byte, keyPath string) ([]byte, error)
 	return decryptedData, nil
 }
 
+// encryptWithCertificateCMS encrypts data using openssl cms command for large data
+func encryptWithCertificateCMS(plainData []byte, certPath string) ([]byte, error) {
+	// Create temporary file for plain input data
+	tmpInput, err := os.CreateTemp("", "encrypt-input-*.txt")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp input file: %w", err)
+	}
+	defer os.Remove(tmpInput.Name())
+	defer tmpInput.Close()
+
+	// Write plain data to temp file
+	if _, err := tmpInput.Write(plainData); err != nil {
+		return nil, fmt.Errorf("failed to write to temp file: %w", err)
+	}
+	tmpInput.Close()
+
+	// Create temporary file for output
+	tmpOutput, err := os.CreateTemp("", "encrypt-output-*.bin")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp output file: %w", err)
+	}
+	defer os.Remove(tmpOutput.Name())
+	tmpOutput.Close()
+
+	// Execute openssl cms command for encryption
+	// openssl cms -encrypt -in plaintext.txt -out encrypted.bin -outform DER -recip cert.pem
+	cmd := exec.Command("openssl", "cms", "-encrypt", "-in", tmpInput.Name(), "-out", tmpOutput.Name(), "-outform", "DER", "-recip", certPath)
+
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("openssl command failed: %w, output: %s", err, string(output))
+	}
+
+	// Read encrypted data from output file
+	encryptedData, err := os.ReadFile(tmpOutput.Name())
+	if err != nil {
+		return nil, fmt.Errorf("failed to read encrypted data: %w", err)
+	}
+
+	return encryptedData, nil
+}
+
 // encryptWithCertificate encrypts data using openssl pkeyutl command
 func encryptWithCertificate(plainData []byte, certPath string) ([]byte, error) {
 	// Create temporary file for plain input data
@@ -443,8 +484,15 @@ func validateConfig(configContent string) error {
 	return nil
 }
 
-// generateCertificate generates a certificate and private key based on the config
+// generateCertificate generates a certificate and private key based on the config,
+// encrypts them with the root certificate, and stores them in the certificates folder
 func generateCertificate(configContent, caCertPath, caKeyPath string) (string, string, error) {
+	// Create certificates directory if it doesn't exist
+	certsDir := "certificates"
+	if err := os.MkdirAll(certsDir, 0755); err != nil {
+		return "", "", fmt.Errorf("failed to create certificates directory: %w", err)
+	}
+
 	// Create temporary directory for certificate generation
 	tmpDir, err := os.MkdirTemp("", "cert-gen-*")
 	if err != nil {
@@ -491,6 +539,33 @@ func generateCertificate(configContent, caCertPath, caKeyPath string) (string, s
 	keyData, err := os.ReadFile(keyPath)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to read private key: %w", err)
+	}
+
+	// Encrypt the certificate with the root certificate using CMS
+	encryptedCert, err := encryptWithCertificateCMS(certData, caCertPath)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to encrypt certificate: %w", err)
+	}
+
+	// Encrypt the private key with the root certificate using CMS
+	encryptedKey, err := encryptWithCertificateCMS(keyData, caCertPath)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to encrypt private key: %w", err)
+	}
+
+	// Generate unique filenames based on timestamp
+	timestamp := fmt.Sprintf("%d", os.Getpid())
+	encryptedCertPath := fmt.Sprintf("%s/cert_%s.enc", certsDir, timestamp)
+	encryptedKeyPath := fmt.Sprintf("%s/key_%s.enc", certsDir, timestamp)
+
+	// Write encrypted certificate to file
+	if err := os.WriteFile(encryptedCertPath, encryptedCert, 0600); err != nil {
+		return "", "", fmt.Errorf("failed to write encrypted certificate: %w", err)
+	}
+
+	// Write encrypted private key to file
+	if err := os.WriteFile(encryptedKeyPath, encryptedKey, 0600); err != nil {
+		return "", "", fmt.Errorf("failed to write encrypted private key: %w", err)
 	}
 
 	return string(certData), string(keyData), nil
