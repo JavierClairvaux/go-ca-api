@@ -437,3 +437,6 @@ cat decrypted-key.pem
 - Generated certificates are valid for 365 days by default
 - Encrypted certificates are stored using CMS (Cryptographic Message Syntax) format in DER encoding
 - Certificate hierarchy: Root CA → Intermediate CA → Generated Certificates
+
+## Demo
+Run `repo_demo.sh` to go through the whole demo interactively.
