@@ -265,8 +265,8 @@ func verifyHandler(c *gin.Context) {
 		return
 	}
 
-	// Verify the certificate against the root CA
-	valid, message, err := verifyCertificate(req.Certificate, certPath)
+	// Verify the certificate against the root CA and intermediate CA
+	valid, message, err := verifyCertificate(req.Certificate, certPath, intermediateCertPath)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
 			Error: fmt.Sprintf("Verification error: %v", err),
@@ -690,7 +690,7 @@ authorityKeyIdentifier = keyid:always
 }
 
 // verifyCertificate verifies that a certificate was signed by the root CA
-func verifyCertificate(certContent, caCertPath string) (bool, string, error) {
+func verifyCertificate(certContent, caCertPath, intermediateCertPath string) (bool, string, error) {
 	// Create temporary file for the certificate to verify
 	tmpCert, err := os.CreateTemp("", "verify-cert-*.pem")
 	if err != nil {
@@ -705,9 +705,9 @@ func verifyCertificate(certContent, caCertPath string) (bool, string, error) {
 	}
 	tmpCert.Close()
 
-	// Execute openssl verify command
-	// openssl verify -CAfile root-ca-cert.pem cert-to-verify.pem
-	cmd := exec.Command("openssl", "verify", "-CAfile", caCertPath, tmpCert.Name())
+	// Execute openssl verify command with intermediate certificate
+	// openssl verify -CAfile root-ca-cert.pem -untrusted intermediate-ca-cert.pem cert-to-verify.pem
+	cmd := exec.Command("openssl", "verify", "-CAfile", caCertPath, "-untrusted", intermediateCertPath, tmpCert.Name())
 	output, err := cmd.CombinedOutput()
 
 	outputStr := strings.TrimSpace(string(output))
@@ -715,7 +715,7 @@ func verifyCertificate(certContent, caCertPath string) (bool, string, error) {
 	// Check if verification succeeded
 	// OpenSSL outputs "filename: OK" on success
 	if err == nil && strings.Contains(outputStr, ": OK") {
-		return true, "Certificate is valid and was signed by the root CA", nil
+		return true, "Certificate is valid and was signed by the intermediate CA", nil
 	}
 
 	// Verification failed
